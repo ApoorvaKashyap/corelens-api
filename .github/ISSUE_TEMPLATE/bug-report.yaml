@@ -1,0 +1,43 @@
+name: Bug Report
+description: File a bug report.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: Please describe issue you faced.
+      description: Also tell us, what did you expect to happen?
+      placeholder: Describe the issue in detail
+    validations:
+      required: true
+  - type: input
+    id: entity
+    attributes:
+      label: Entity
+      description: Which entity are you running the pipeline on?
+      placeholder: Microwatershed
+    validations:
+      required: true
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: "Give the details of the environment you are using. Give 'docker:tag' if you are using docker."
+      placeholder: "Please include details like versions of duckdb and polars, OS etc"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: Please copy and paste any relevant log output. This will be automatically formatted into code, so no need for backticks.
+      render: shell
+  - type: upload
+    id: screenshots
+    attributes:
+      label: Upload Files
+      description: If applicable, add screenshots or logs to help explain your problem.
+    validations:
+      required: false
+      accept: ".png,.jpg,.gif,.log,.txt,.zip"
