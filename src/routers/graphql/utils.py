@@ -1,16 +1,15 @@
 """GraphQL schema and router for coordinate-based entity lookups."""
 
-import strawberry
-from strawberry.fastapi import GraphQLRouter
-
 from core_lens.entities.mws import MWSEntity
 from core_lens.entities.tehsil import TehsilEntity
 from core_lens.entities.waterbody import WaterbodyEntity
 from core_lens.utils.spatial import point_in_entities
-from src.configs import settings
+from loguru import logger
+import strawberry
+from strawberry.fastapi import GraphQLRouter
 
 from src.app.graphql.utils import EntityFilterInput, EntityResult
-
+from src.configs import settings
 
 _ENTITIES = [
     MWSEntity(settings.data_root),
@@ -29,6 +28,7 @@ class CoordinateDetails:
             "lon": filter.coordinates.longitude,
         }
         result = point_in_entities(latlon, _ENTITIES)
+        logger.info("Fetched entity details for the coordinates")
         return EntityResult(
             mws=result.get("MWSEntity"),
             tehsil=result.get("TehsilEntity"),
