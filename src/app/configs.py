@@ -28,6 +28,7 @@ class Settings(BaseSettings):
 
     # Working Directory
     temp_path: str = "/tmp/"  # noqa: S108
+    data_root: str = "./data/"
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
