@@ -12,6 +12,7 @@ dependencies = [
     "fastapi[standard]>=0.140.7",
     "strawberry-graphql[fastapi]>=0.323.2",
     "loguru>=0.7.3",
+    "polars>=1.43.1",
 ]
 
 [dependency-groups]
@@ -28,6 +29,7 @@ docs = [
 
 [tool.mypy]
 strict = true
+plugins = ["pydantic.mypy", "strawberry.ext.mypy_plugin"]
 
 [[tool.mypy.overrides]]
 module = "tests.*"
