@@ -23,3 +23,4 @@ class EntityResult:
     mws: str | None
     tehsil: str | None
     waterbody: str | None
+    farm: str | None
