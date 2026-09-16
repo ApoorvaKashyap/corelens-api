@@ -11,7 +11,7 @@ from __future__ import annotations
 import strawberry
 
 from src.app.graphql import generated as gql_generated
-from src.app.graphql.utils import EntityResult
+from src.app.graphql.utils import EntityResult, FarmTimeseries
 
 
 def build_schema() -> strawberry.Schema:
@@ -29,7 +29,7 @@ def build_schema() -> strawberry.Schema:
     """
     from src.app.graphql.resolvers import (
         resolve_entities,
-        resolve_farms,
+        resolve_farm_timeseries,
         resolve_mws,
         resolve_tehsils,
         resolve_waterbody,
@@ -40,7 +40,6 @@ def build_schema() -> strawberry.Schema:
     )
     assert gql_generated.TEHSIL_GENERATED is not None
     assert gql_generated.MWSConnection is not None
-    assert gql_generated.FARM_GENERATED is not None
 
     @strawberry.type
     class Query:
@@ -56,8 +55,8 @@ def build_schema() -> strawberry.Schema:
                 resolver=resolve_waterbody
             )
         )
-        farms: list[gql_generated.FARM_GENERATED.strawberry_type] = strawberry.field(  # type: ignore[name-defined]
-            resolver=resolve_farms
+        farm_timeseries: FarmTimeseries = strawberry.field(
+            resolver=resolve_farm_timeseries
         )
 
     return strawberry.Schema(query=Query)

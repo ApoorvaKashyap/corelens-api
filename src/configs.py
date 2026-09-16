@@ -30,6 +30,9 @@ class Settings(BaseSettings):
     temp_path: str = "/tmp/"  # noqa: S108
     data_root: str = "./data/"
 
+    # Farm boundaries are partitioned as <farm_data_root>/<state>/<district>/<block>/*.parquet
+    farm_data_root: str = "./data/farm_boundaries/"
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
 

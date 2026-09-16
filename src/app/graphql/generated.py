@@ -17,7 +17,6 @@ if TYPE_CHECKING:
 MWS_GENERATED: GeneratedType | None = None
 TEHSIL_GENERATED: GeneratedType | None = None
 WATERBODY_GENERATED: GeneratedType | None = None
-FARM_GENERATED: GeneratedType | None = None
 
 MWSConnection: type | None = None
 
@@ -36,10 +35,8 @@ def initialize(data_root: str) -> None:
         MWS_GENERATED, \
         TEHSIL_GENERATED, \
         WATERBODY_GENERATED, \
-        FARM_GENERATED, \
         MWSConnection
 
-    from core_lens.entities.farms import FarmEntity
     from core_lens.entities.mws import MWSEntity
     from core_lens.entities.tehsil import TehsilEntity
     from core_lens.entities.waterbody import WaterbodyEntity
@@ -51,7 +48,6 @@ def initialize(data_root: str) -> None:
     WATERBODY_GENERATED = build_graphql_type(
         WaterbodyEntity(data_root=data_root), "Waterbody"
     )
-    FARM_GENERATED = build_graphql_type(FarmEntity(data_root=data_root), "Farm")
 
     MWSConnection = build_connection_type(
         MWS_GENERATED.strawberry_type, "MWSConnection"

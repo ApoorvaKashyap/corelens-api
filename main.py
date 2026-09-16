@@ -10,6 +10,7 @@ from loguru import logger
 
 from src.configs import settings
 from src.routers.rest import meta
+from fastapi.middleware.cors import CORSMiddleware
 
 
 @asynccontextmanager
@@ -57,4 +58,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, Any]:
 
 
 app = FastAPI(lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        # add your deployed frontend origin(s) here once known
+    ],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
 app.include_router(meta.router, prefix="/api/v1")

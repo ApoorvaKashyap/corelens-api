@@ -17,6 +17,7 @@ possibly differently-cased, parquet column names before passing to where().
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any, Optional
 
 from core_lens.entities.farms import FarmEntity
@@ -29,15 +30,23 @@ import polars as pl
 import polars.selectors as cs
 from strawberry.types import Info
 
-from src.app.graphql.utils import EntityFilterInput, EntityResult
+from src.app.graphql.utils import (
+    EntityFilterInput,
+    EntityResult,
+    FarmAnnual,
+    FarmMonthly,
+    FarmTimeseries,
+)
 from src.configs import settings
 
 _SPATIAL_ENTITIES = [
     MWSEntity(settings.data_root),
     TehsilEntity(settings.data_root),
     WaterbodyEntity(settings.data_root),
-    FarmEntity(settings.data_root),
 ]
+# FarmEntity is intentionally excluded: farm boundaries are partitioned by
+# state/district/block on disk (see resolve_farm_timeseries), so there is no
+# single flat farms dataset to point-in-polygon scan against.
 
 
 def _wants_geometry(info: Info, field_name: str = "geometry") -> bool:
@@ -243,45 +252,67 @@ def resolve_waterbody(
     ]
 
 
-def resolve_farms(
-    info: Info,
-    district: Optional[str] = None,
-    state: Optional[str] = None,
-    farm_id: Optional[list[str]] = None,
-) -> list[Any]:
-    """Resolve a list of farms with optional attribute filters.
+_FARM_ANNUAL_COLS = [f.name for f in dataclasses.fields(FarmAnnual)]
+_FARM_MONTHLY_COLS = [f.name for f in dataclasses.fields(FarmMonthly)]
+
+
+def resolve_farm_timeseries(
+    state: str, district: str, block: str, farm_id: str
+) -> FarmTimeseries:
+    """Resolve annual + monthly time series for one farm.
+
+    Farm boundary data is partitioned on disk as
+    ``<farm_data_root>/<state>/<district>/<block>/farm_{static,annual,monthly}.parquet``
+    rather than living under one flat data_root like the other entities, so a
+    fresh FarmEntity is built per request from the caller-supplied location.
 
     Args:
-        info: Strawberry resolver info for field selection inspection.
-        district: Optional district filter.
-        state: Optional state filter.
-        farm_id: Optional list of farm IDs to filter by.
+        state: State name, matching the partition folder name (e.g. "rajasthan").
+        district: District name, matching the partition folder name.
+        block: Block/tehsil name, matching the partition folder name.
+        farm_id: The farm's unique id, as found in farm_static.parquet.
 
     Returns:
-        A list of generated Farm instances.
+        A FarmTimeseries with the annual and monthly rows for that farm_id.
+        Both lists are empty if the farm_id has no matching rows.
     """
-    from src.app.graphql.generated import FARM_GENERATED, row_to_instance
+    block_dir = f"{settings.farm_data_root.rstrip('/')}/{state}/{district}/{block}"
+    entity = FarmEntity(data_root=block_dir)
+    view = entity.where(farm_id=farm_id)
 
-    assert FARM_GENERATED is not None
+    annual_df = view.annual.df()
 
-    filters = _to_real_columns(
-        FARM_GENERATED, district=district, state=state, farm_id=farm_id
+    # farm_monthly.parquet carries both a "year" (int) and a "date" (datetime)
+    # column. core_lens's sub_annual time-column auto-detection matches "year"
+    # first and then treats it as a date, which crashes. Scan directly instead
+    # of going through view.sub_annual until that detection is fixed upstream.
+    monthly_df = (
+        pl.scan_parquet(entity._resolve(entity.sub_annual_path))
+        .filter(pl.col("farm_id") == farm_id)
+        .collect()
     )
 
-    entity = FarmEntity(data_root=settings.data_root)
-    view = entity.where(**filters) if filters else entity.where()
-    result = view.static
-
-    if _wants_geometry(info):
-        result = result.with_geometry()
-
-    df: pl.DataFrame = result.data.collect().with_columns(cs.float().fill_nan(None))
-    geom_present = "geometry" in df.columns
-    return [
-        row_to_instance(
-            row,
-            FARM_GENERATED,
-            geometry=row.get("geometry") if geom_present else None,
-        )
-        for row in df.iter_rows(named=True)
+    annual = [
+        FarmAnnual(**{col: row.get(col) for col in _FARM_ANNUAL_COLS})
+        for row in annual_df.iter_rows(named=True)
     ]
+    monthly = [
+        FarmMonthly(**{col: row.get(col) for col in _FARM_MONTHLY_COLS})
+        for row in monthly_df.iter_rows(named=True)
+    ]
+
+    logger.info(
+        "Fetched farm timeseries for {} ({} annual rows, {} monthly rows)",
+        farm_id,
+        len(annual),
+        len(monthly),
+    )
+
+    return FarmTimeseries(
+        farm_id=farm_id,
+        state=state,
+        district=district,
+        block=block,
+        annual=annual,
+        monthly=monthly,
+    )
