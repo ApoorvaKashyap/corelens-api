@@ -12,6 +12,7 @@ dependencies = [
     "fastapi[standard]>=0.140.7",
     "strawberry-graphql[fastapi]>=0.323.2",
     "loguru>=0.7.3",
+    "polars>=1.43.1",
 ]
 
 [dependency-groups]
@@ -28,6 +29,7 @@ docs = [
 
 [tool.mypy]
 strict = true
+plugins = ["pydantic.mypy", "strawberry.ext.mypy_plugin"]
 
 [[tool.mypy.overrides]]
 module = "tests.*"
@@ -35,10 +37,20 @@ disallow_untyped_defs = false
 disallow_incomplete_defs = false
 
 
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+
+
 [tool.ruff.lint]
 select = [
     "E",
     "F", # Default rules (Error and Pyflakes)
+    "I", # isort — Black-compatible import ordering
     "S", # Enable all flake8-bandit security rules
 ]
 ignore = [
@@ -52,3 +64,6 @@ ignore = [
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
+
+[tool.ruff.lint.isort]
+force-sort-within-sections = true
