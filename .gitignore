@@ -2,6 +2,8 @@
 # Created by https://www.toptal.com/developers/gitignore/api/visualstudiocode,linux,django,jetbrains+all,python
 # Edit at https://www.toptal.com/developers/gitignore?templates=visualstudiocode,linux,django,jetbrains+all,python
 
+corelens-api.tar
+
 ### Django ###
 *.log
 *.pot
