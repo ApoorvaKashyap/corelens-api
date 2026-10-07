@@ -17,3 +17,8 @@ def get_active_tehsils() -> dict[str, list[str]]:
     )
     logger.info("Fetched list of active tehsils")
     return {"tehsils": tehsils}
+
+
+@router.get("/health")
+def check_health() -> dict[str, str]:
+    return {"status": "ok", "data_root" : settings.data_root, "farm_root" : settings.farm_data_root}

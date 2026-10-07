@@ -17,7 +17,6 @@ possibly differently-cased, parquet column names before passing to where().
 
 from __future__ import annotations
 
-import dataclasses
 from typing import Any, Optional
 
 from core_lens.entities.farms import FarmEntity
@@ -30,19 +29,13 @@ import polars as pl
 import polars.selectors as cs
 from strawberry.types import Info
 
-from src.app.graphql.utils import (
-    EntityFilterInput,
-    EntityResult,
-    FarmAnnual,
-    FarmMonthly,
-    FarmTimeseries,
-)
+from src.app.graphql.utils import EntityFilterInput, EntityResult
 from src.configs import settings
 
 _SPATIAL_ENTITIES = [
-    MWSEntity(settings.data_root),
-    TehsilEntity(settings.data_root),
-    WaterbodyEntity(settings.data_root),
+    MWSEntity(settings.data_root, storage_options=settings.aws_storage_options),
+    TehsilEntity(settings.data_root, storage_options=settings.aws_storage_options),
+    WaterbodyEntity(settings.data_root, storage_options=settings.aws_storage_options),
 ]
 # FarmEntity is intentionally excluded: farm boundaries are partitioned by
 # state/district/block on disk (see resolve_farm_timeseries), so there is no
@@ -153,7 +146,9 @@ def resolve_mws(
         MWS_GENERATED, district=district, state=state, tehsil=tehsil, mws_id=mws_id
     )
 
-    entity = MWSEntity(data_root=settings.data_root)
+    entity = MWSEntity(
+        data_root=settings.data_root, storage_options=settings.aws_storage_options
+    )
     view = entity.where(**filters) if filters else entity.where()
     result = view.static
 
@@ -199,7 +194,9 @@ def resolve_tehsils(
         TEHSIL_GENERATED, district=district, state=state, tehsil_id=tehsil_id
     )
 
-    entity = TehsilEntity(data_root=settings.data_root)
+    entity = TehsilEntity(
+        data_root=settings.data_root, storage_options=settings.aws_storage_options
+    )
     view = entity.where(**filters) if filters else entity.where()
     result = view.static
 
@@ -233,7 +230,9 @@ def resolve_waterbody(
         WATERBODY_GENERATED, district=district, state=state, waterbody_id=waterbody_id
     )
 
-    entity = WaterbodyEntity(data_root=settings.data_root)
+    entity = WaterbodyEntity(
+        data_root=settings.data_root, storage_options=settings.aws_storage_options
+    )
     view = entity.where(**filters) if filters else entity.where()
     result = view.static
 
@@ -252,52 +251,64 @@ def resolve_waterbody(
     ]
 
 
-_FARM_ANNUAL_COLS = [f.name for f in dataclasses.fields(FarmAnnual)]
-_FARM_MONTHLY_COLS = [f.name for f in dataclasses.fields(FarmMonthly)]
-
-
-def resolve_farm_timeseries(
-    state: str, district: str, block: str, farm_id: str
-) -> FarmTimeseries:
+def resolve_farm_timeseries(state: str, district: str, block: str, farm_id: str) -> Any:
     """Resolve annual + monthly time series for one farm.
 
     Farm boundary data is partitioned on disk as
-    ``<farm_data_root>/<state>/<district>/<block>/farm_{static,annual,monthly}.parquet``
-    rather than living under one flat data_root like the other entities, so a
-    fresh FarmEntity is built per request from the caller-supplied location.
+    ``<farm_data_root>/<state>/<district>/<block>/`` (each block folder is its
+    own FarmEntity data_root, per whatever static/annual/sub_annual filenames
+    the installed core_lens FarmEntity declares) rather than living under one
+    flat data_root like the other entities, so a fresh FarmEntity is built per
+    request from the caller-supplied location.
 
     Args:
         state: State name, matching the partition folder name (e.g. "rajasthan").
         district: District name, matching the partition folder name.
         block: Block/tehsil name, matching the partition folder name.
-        farm_id: The farm's unique id, as found in farm_static.parquet.
+        farm_id: The farm's unique id, as found in the static file.
 
     Returns:
-        A FarmTimeseries with the annual and monthly rows for that farm_id.
-        Both lists are empty if the farm_id has no matching rows.
+        A FarmTimeseries (generated type) with the annual and monthly rows for
+        that farm_id. Both lists are empty if the farm_id has no matching rows.
     """
+    from src.app.graphql.generated import (
+        FARM_ANNUAL_GENERATED,
+        FARM_MONTHLY_GENERATED,
+        FarmTimeseriesType,
+        row_to_instance,
+    )
+
+    assert FARM_ANNUAL_GENERATED is not None
+    assert FARM_MONTHLY_GENERATED is not None
+    assert FarmTimeseriesType is not None
+
     block_dir = f"{settings.farm_data_root.rstrip('/')}/{state}/{district}/{block}"
-    entity = FarmEntity(data_root=block_dir)
+    entity = FarmEntity(
+        data_root=block_dir, storage_options=settings.aws_storage_options
+    )
     view = entity.where(farm_id=farm_id)
 
     annual_df = view.annual.df()
 
-    # farm_monthly.parquet carries both a "year" (int) and a "date" (datetime)
+    # The sub_annual file carries both a "year" (int) and a "date" (datetime)
     # column. core_lens's sub_annual time-column auto-detection matches "year"
     # first and then treats it as a date, which crashes. Scan directly instead
     # of going through view.sub_annual until that detection is fixed upstream.
     monthly_df = (
-        pl.scan_parquet(entity._resolve(entity.sub_annual_path))
+        pl.scan_parquet(
+            entity._resolve(entity.sub_annual_path),
+            storage_options=settings.aws_storage_options,
+        )
         .filter(pl.col("farm_id") == farm_id)
         .collect()
     )
 
     annual = [
-        FarmAnnual(**{col: row.get(col) for col in _FARM_ANNUAL_COLS})
+        row_to_instance(row, FARM_ANNUAL_GENERATED)
         for row in annual_df.iter_rows(named=True)
     ]
     monthly = [
-        FarmMonthly(**{col: row.get(col) for col in _FARM_MONTHLY_COLS})
+        row_to_instance(row, FARM_MONTHLY_GENERATED)
         for row in monthly_df.iter_rows(named=True)
     ]
 
@@ -308,7 +319,7 @@ def resolve_farm_timeseries(
         len(monthly),
     )
 
-    return FarmTimeseries(
+    return FarmTimeseriesType(
         farm_id=farm_id,
         state=state,
         district=district,

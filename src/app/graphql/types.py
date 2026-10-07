@@ -102,7 +102,10 @@ def build_graphql_type(entity: BaseEntity, type_name: str) -> GeneratedType:
         A GeneratedType wrapping the Strawberry-annotated dataclass.
     """
     profile = entity.schema_profile
-    static_schema = pl.read_parquet_schema(entity._resolve(entity.static_path))
+    static_schema = pl.scan_parquet(
+        entity._resolve(entity.static_path),
+        storage_options=entity._storage_options or None,
+    ).collect_schema()
 
     field_to_column: dict[str, str] = {}
     fields: list[tuple[str, Any] | tuple[str, Any, Any]] = []
@@ -130,6 +133,69 @@ def build_graphql_type(entity: BaseEntity, type_name: str) -> GeneratedType:
     )
 
 
+def build_temporal_graphql_type(
+    entity: BaseEntity, type_name: str, resolution: str
+) -> GeneratedType:
+    """Build a Strawberry type from one entity's annual or sub_annual schema.
+
+    Same approach as build_graphql_type, applied to a temporal grain instead
+    of the static grain: key column(s) and the detected time column are
+    required fields, every other real column is Optional. There is no
+    geometry field at these grains.
+
+    Args:
+        entity: The core_lens entity to generate a type for.
+        type_name: The name of the generated Strawberry type.
+        resolution: Either "annual" or "sub_annual".
+
+    Returns:
+        A GeneratedType wrapping the Strawberry-annotated dataclass.
+    """
+    profile = entity.schema_profile
+    if resolution == "annual":
+        path = entity.annual_path
+        time_col = profile.annual_time_col
+        extra_cols = profile.extra_annual_cols
+    else:
+        path = entity.sub_annual_path
+        time_col = profile.sub_annual_time_col
+        extra_cols = profile.extra_sub_annual_cols
+
+    assert path is not None, f"Entity has no {resolution}_path"
+    schema = pl.scan_parquet(
+        entity._resolve(path), storage_options=entity._storage_options or None
+    ).collect_schema()
+
+    field_to_column: dict[str, str] = {}
+    fields: list[tuple[str, Any] | tuple[str, Any, Any]] = []
+
+    for col in profile.key_cols:
+        name = _normalize_field_name(col)
+        field_to_column[name] = col
+        fields.append((name, _python_type_for(schema[col])))
+
+    if time_col is not None:
+        name = _normalize_field_name(time_col)
+        if name not in field_to_column:
+            field_to_column[name] = time_col
+            fields.append((name, _python_type_for(schema[time_col])))
+
+    for col in extra_cols:
+        name = _normalize_field_name(col)
+        if name in field_to_column:
+            continue
+        field_to_column[name] = col
+        py_type = _python_type_for(schema[col])
+        fields.append((name, Optional[py_type], dataclasses.field(default=None)))
+
+    cls = dataclasses.make_dataclass(type_name, fields)
+    return GeneratedType(
+        strawberry_type=strawberry.type(cls),
+        field_to_column=field_to_column,
+        key_cols=[_normalize_field_name(c) for c in profile.key_cols],
+    )
+
+
 def build_connection_type(item_strawberry_type: type, type_name: str) -> type:
     """Build a paginated connection type wrapping a dynamically-generated item type.
 
@@ -148,6 +214,35 @@ def build_connection_type(item_strawberry_type: type, type_name: str) -> type:
         ("total_count", int),
         ("limit", int),
         ("offset", int),
+    ]
+    cls = dataclasses.make_dataclass(type_name, fields)
+    return strawberry.type(cls)
+
+
+def build_farm_timeseries_type(
+    annual_item_type: type, monthly_item_type: type, type_name: str
+) -> type:
+    """Build the FarmTimeseries wrapper type around the generated annual/monthly types.
+
+    farm_id/state/district/block are request-echo fields, not parquet columns,
+    so they're declared directly rather than generated from a schema.
+
+    Args:
+        annual_item_type: The generated Strawberry type for one annual row.
+        monthly_item_type: The generated Strawberry type for one monthly row.
+        type_name: The name of the generated Strawberry type.
+
+    Returns:
+        A Strawberry-annotated dataclass with farm_id, state, district, block,
+        annual, and monthly fields.
+    """
+    fields = [
+        ("farm_id", str),
+        ("state", str),
+        ("district", str),
+        ("block", str),
+        ("annual", list[annual_item_type]),  # type: ignore[valid-type]
+        ("monthly", list[monthly_item_type]),  # type: ignore[valid-type]
     ]
     cls = dataclasses.make_dataclass(type_name, fields)
     return strawberry.type(cls)

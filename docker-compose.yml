@@ -1,0 +1,16 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ${DATA_ROOT_HOST}:/data:ro
+    environment:
+      DATA_ROOT: /data
+      FARM_DATA_ROOT: ${FARM_DATA_ROOT_HOST}
+      FARM_SCHEMA_SAMPLE_BLOCK: ${FARM_SCHEMA_SAMPLE_BLOCK}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_REGION: ${AWS_REGION}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    restart: unless-stopped

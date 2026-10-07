@@ -238,7 +238,7 @@ wheels = [
 
 [[package]]
 name = "core-lens"
-version = "0.1.dev180"
+version = "0.1.dev186"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "awscrt" },
@@ -252,9 +252,9 @@ dependencies = [
     { name = "pyproj" },
     { name = "shapely" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/fc/b4/6ea99633bdc44948a204f1bc5641b6a39b018cc5731ab7699442e250d659/core_lens-0.1.dev180.tar.gz", hash = "sha256:2dd54e216d6408457d20f21e23e3d1891a0605dd400ce502c7c0f3b99f98688f", size = 365708, upload-time = "2026-07-29T08:10:17.532Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/4e/f4/eadd811d4ca0014f55b912f5e4a1dfa6002d2f4a1ece0b18def62c0a247d/core_lens-0.1.dev186.tar.gz", hash = "sha256:c8804c337c06a8eb4eedf78d29f78e298b3af094dc1180e71974cf438eb5b7ef", size = 375132, upload-time = "2026-09-16T10:49:26.568Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/4e/a2/1f67e4d1dd5aac59dca85ec16a72e8c3dc1537c23140009ba794492c1d06/core_lens-0.1.dev180-py3-none-any.whl", hash = "sha256:14d86bc6256bffc127de6a54e94aff647178a2dd04e9ef8ed0ccd0f61f3d6e1c", size = 92793, upload-time = "2026-07-29T08:10:15.172Z" },
+    { url = "https://files.pythonhosted.org/packages/f5/9f/d10296bb38ffe16987d8201f376e26555c5fec8c08c5fb38fa0fc390c413/core_lens-0.1.dev186-py3-none-any.whl", hash = "sha256:ea797609fe76cead560fce08972db948116055b0a2bc765777d59c9784172811", size = 94214, upload-time = "2026-09-16T10:49:22.551Z" },
 ]
 
 [package.optional-dependencies]
