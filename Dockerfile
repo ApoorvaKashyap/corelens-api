@@ -9,6 +9,15 @@ COPY pyproject.toml uv.lock ./
 RUN uv lock --upgrade-package core-lens
 RUN uv sync --frozen --no-dev --no-install-project
 
+# core-lens patch: several entity/spatial read paths don't forward
+# storage_options to pl.scan_parquet, so S3-backed queries fall through to
+# the full AWS credential chain (including an EC2 IMDS lookup that hangs for
+# ~10s per attempt off of EC2). Overwrites the installed package with fixed
+# copies until the fix lands in a core-lens release. See patches/core_lens/.
+COPY patches/core_lens/base/entity.py .venv/lib/python3.14/site-packages/core_lens/base/entity.py
+COPY patches/core_lens/base/view.py .venv/lib/python3.14/site-packages/core_lens/base/view.py
+COPY patches/core_lens/utils/spatial.py .venv/lib/python3.14/site-packages/core_lens/utils/spatial.py
+
 COPY . .
 RUN uv sync --frozen --no-dev
 

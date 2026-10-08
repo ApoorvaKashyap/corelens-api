@@ -1,0 +1,547 @@
+"""Lazy, immutable view of a scoped entity pending materialisation."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+import polars as pl
+from loguru import logger
+
+from enum import Enum
+
+from core_lens.schema.profile import Resolution
+from core_lens.utils.polars_utils import (
+    scan_with_key_filter,
+    collect_lf,
+    cached_read_schema,
+)
+
+if TYPE_CHECKING:
+    import shapely
+    from core_lens.aoi import SeasonConfig
+    from core_lens.base.entity import BaseEntity
+    from core_lens.base.result import Result
+
+
+class Season(Enum):
+    """Season enum.
+
+    Enumerates standard agronomic seasons used across Core Lens for temporal filtering.
+    """
+
+    KHARIF = "kharif"
+    RABI = "rabi"
+    ZAID = "zaid"
+    CURRENT = "current"
+
+
+class View:
+    """Lazy, immutable snapshot of a scoped entity pending materialisation.
+
+    A ``View`` is produced by the filter methods on :class:`~core_lens.base.entity.BaseEntity`
+    (:meth:`~BaseEntity.where`, :meth:`~BaseEntity.spatial_filter`,
+    :meth:`~BaseEntity.spatial_join`).  It records *what* to load without
+    touching any Parquet file.  Data is only scanned when one of the three
+    materialisation properties is accessed, and is materialised when ``.df()``
+    is called on the returned ``Result``.
+
+    ``View`` is immutable.  Every method that would mutate state instead
+    returns a new ``View`` with the updated field, leaving the original
+    untouched.  This makes it safe to branch a view and materialise it in
+    different ways::
+
+        view = aoi.mws.where(tehsil="Pangi")
+        annual = view.between("2010-01-01", "2023-12-31").annual
+        static = view.static
+
+    Attributes:
+        keys: A ``pl.LazyFrame`` containing the resolved key column(s) for
+            all entity instances that passed the spatial/attribute filters.
+            This is the index slice — no data columns, only IDs.
+        entity: Reference to the parent :class:`~core_lens.base.entity.BaseEntity`
+            that produced this view.  Used during materialisation to resolve
+            file paths and schema.
+        entity_name: Human-readable name for the entity (e.g. ``"mws"``).
+            Used to namespace joined columns and populate
+            :attr:`~core_lens.base.result.Result.entity_name`.
+        time_filter: A dict encoding the pending time constraint set by
+            :meth:`between`, or ``None`` if no time filter has been applied.
+            The materialisation step reads this dict to build predicate
+            pushdown expressions.
+        join_spec: A dict encoding a deferred :meth:`~BaseEntity.spatial_join`
+            request, or ``None``.  Evaluated during materialisation after the
+            primary scan is complete.
+
+    """
+
+    def __init__(
+        self,
+        keys: pl.DataFrame | pl.LazyFrame,
+        entity: BaseEntity,
+        entity_name: str,
+        time_filter: dict[str, Any] | None = None,
+        join_spec: dict[str, Any] | None = None,
+        season_config: SeasonConfig | None = None,
+    ) -> None:
+        """Initialize View.
+
+        Args:
+            keys: Polars LazyFrame or DataFrame containing the resolved IDs.
+            entity: Parent BaseEntity instance defining the schema and paths.
+            entity_name: Registered string name of the entity.
+            time_filter: Active time filter conditions, if any.
+            join_spec: Active spatial join spec, if any.
+            season_config: Optional season date configuration overrides.
+        """
+        self.keys = keys.lazy() if isinstance(keys, pl.DataFrame) else keys
+        self.entity = entity
+        self.entity_name = entity_name
+        self.time_filter = time_filter
+        self.join_spec = join_spec
+        # season_config is only needed at materialisation time when a season
+        # time_filter is present.  Carried forward by between() to new Views.
+        self._season_config = season_config
+        # Inherit storage_options from entity so all I/O uses the same credentials.
+        self._storage_options: dict[str, Any] = dict(entity._storage_options)
+
+    def where(self, **kwargs: Any) -> "View":
+        """Return a new View further filtered by attributes.
+
+        Each keyword argument is interpreted as ``column=value`` applied to
+        the static file's attribute columns.  Multiple arguments are AND-ed.
+
+        Args:
+            **kwargs (Any): Arbitrary column–value pairs to filter on.
+
+        Returns:
+            View: A new lazy :class:`View` with the narrowed keys.
+
+        """
+        static = self.entity._resolve(self.entity.static_path)
+
+        lf = scan_with_key_filter(
+            path=static,
+            key_cols=self.entity.key_cols,
+            key_values=self.keys,
+            storage_options=self._storage_options or None,
+        )
+        schema_types = cached_read_schema(static, self._storage_options)
+
+        filter_expr = pl.lit(True)
+        for col, val in kwargs.items():
+            is_list_col = isinstance(schema_types.get(col), pl.List)
+            if isinstance(val, list):
+                if is_list_col:
+                    filter_expr = (
+                        filter_expr
+                        & pl.col(col).list.eval(pl.element().is_in(val)).list.any()
+                    )
+                else:
+                    filter_expr = filter_expr & pl.col(col).is_in(val)
+            else:
+                if is_list_col:
+                    filter_expr = filter_expr & pl.col(col).list.contains(val)
+                else:
+                    filter_expr = filter_expr & (pl.col(col) == val)
+
+        keys = lf.filter(filter_expr).select(self.entity.key_cols)
+
+        return View(
+            keys=keys,
+            entity=self.entity,
+            entity_name=self.entity_name,
+            time_filter=self.time_filter,
+            join_spec=self.join_spec,
+            season_config=self._season_config,
+        )
+
+    def spatial_filter(
+        self,
+        geometry: "shapely.Geometry | None" = None,
+        bbox: tuple[float, float, float, float] | None = None,
+        relationship: str = "centroid",
+        threshold: float = 0.5,
+    ) -> "View":
+        """Return a new View further filtered by geometry.
+
+        Uses the in-memory bbox index for a fast rectangular pre-filter, then
+        refines with a Shapely STRtree exact-relationship check.
+
+        Args:
+            geometry (shapely.Geometry | None, optional): A Shapely geometry representing the spatial extent.
+            bbox (tuple[float, float, float, float] | None, optional): Bounding box as ``(minx, miny, maxx, maxy)`` in WGS-84.
+            relationship (str, optional): ``"centroid"`` (default) or ``"area"`` mode.
+            threshold (float, optional): Area coverage threshold for ``"area"`` mode.  Default 0.5.
+
+        Returns:
+            View: A new lazy :class:`View` scoped to the given spatial extent.
+
+        Raises:
+            ValueError: If neither ``geometry`` nor ``bbox`` is provided.
+
+        """
+        import shapely.geometry as sgeom
+        from core_lens.utils.spatial import (
+            exact_spatial_filter,
+            bbox_intersects_geometry,
+        )
+
+        if geometry is None and bbox is None:
+            logger.error(
+                "View.spatial_filter failed: neither 'geometry' nor 'bbox' provided."
+            )
+            raise ValueError(
+                "spatial_filter() requires either 'geometry' or 'bbox' to be provided."
+            )
+        if bbox is not None and geometry is None:
+            geometry = sgeom.box(*bbox)
+
+        assert geometry is not None
+
+        profile = self.entity.schema_profile
+        candidates = bbox_intersects_geometry(self.entity._index, geometry)
+        candidates = (
+            candidates.lazy()
+            .join(self.keys, on=self.entity.key_cols, how="inner")
+            .collect()
+        )
+
+        keys_df = exact_spatial_filter(
+            candidates=candidates,
+            static_path=self.entity._resolve(self.entity.static_path),
+            key_cols=self.entity.key_cols,
+            geometry_col=profile.geometry_col,
+            geometry_type=profile.geometry_type,
+            aoi_geometry=geometry,
+            relationship=relationship,
+            threshold=threshold,
+            storage_options=self.entity._storage_options,
+        )
+
+        keys_lf = keys_df.lazy()
+
+        return View(
+            keys=keys_lf,
+            entity=self.entity,
+            entity_name=self.entity_name,
+            time_filter=self.time_filter,
+            join_spec=self.join_spec,
+            season_config=self._season_config,
+        )
+
+    def spatial_join(self, other: "BaseEntity", agg: dict[str, str]) -> "View":
+        """Return a new View with a cross-entity join pending.
+
+        The join is recorded in the View's ``join_spec`` and computed only at
+        materialisation time (``.static``, ``.annual``, or ``.sub_annual``).
+
+        Args:
+            other (BaseEntity): The secondary :class:`BaseEntity` whose columns will be
+                joined and aggregated onto ``self``.
+            agg (dict[str, str]): Mapping of ``{column: aggregation}`` specifying which columns
+                from ``other`` to bring in and how to aggregate them.
+
+        Returns:
+            View: A new lazy :class:`View` with the join spec recorded.
+
+        """
+        if self.join_spec is not None:
+            logger.error(
+                "View.spatial_join failed: View already has a pending spatial_join."
+            )
+            raise ValueError("View already has a pending spatial_join.")
+
+        return View(
+            keys=self.keys,
+            entity=self.entity,
+            entity_name=self.entity_name,
+            time_filter=self.time_filter,
+            join_spec={"other": other, "agg": agg},
+            season_config=self._season_config,
+        )
+
+    def between(
+        self,
+        start: str | None = None,
+        end: str | None = None,
+        *,
+        season: Season | None = None,
+        year: int | tuple[int, int] | None = None,
+    ) -> "View":
+        """Return a new ``View`` with a pending time filter applied.
+
+        Two mutually exclusive modes are supported:
+
+        **Date range mode** — pass ``start`` and ``end`` as ISO-8601 strings::
+
+            view.between("2010-01-01", "2023-12-31")
+
+        **Season mode** — pass ``season`` as a keyword argument.  ``year`` is
+        optional and may be a single year or an inclusive ``(from, to)`` tuple::
+
+            from core_lens.base.view import Season
+
+            view.between(season=Season.KHARIF)
+            view.between(season=Season.KHARIF, year=2020)
+            view.between(season=Season.KHARIF, year=(2018, 2023))
+            view.between(season=Season.CURRENT)
+
+        The returned ``View`` carries the filter in :attr:`time_filter` but
+        does not execute any I/O.  The filter is applied during materialisation
+        via predicate pushdown on the Parquet scan.
+
+        Args:
+            start (str | None, optional): Start of the date range (ISO-8601).  Required in date range
+                mode; must be ``None`` in season mode.
+            end (str | None, optional): End of the date range (ISO-8601).  Required in date range
+                mode; must be ``None`` in season mode.
+            season (Season | None, optional): A :class:`~core_lens.base.view.Season` enum value. Activates season mode.
+            year (int | tuple[int, int] | None, optional): Year or inclusive year range to restrict the season filter.
+                Only valid in season mode.  ``"current"`` season ignores this.
+
+        Returns:
+            View: A new :class:`View` with :attr:`time_filter` set.
+
+        Raises:
+            ValueError: If the arguments are inconsistent (e.g. mixing date
+                range and season arguments, omitting required args, or
+                supplying ``year`` with ``season="current"``).
+
+        """
+        if season is not None and (start is not None or end is not None):
+            logger.error(
+                "View.between failed: Date range (start/end) and season mode are mutually exclusive."
+            )
+            raise ValueError(
+                "View.between: Date range (start/end) and season mode are mutually exclusive. "
+                "Use either positional date strings or the 'season' keyword, not both."
+            )
+
+        if season is None and year is not None:
+            logger.error(
+                "View.between failed: 'year' argument provided without 'season'."
+            )
+            raise ValueError(
+                "View.between: 'year' argument is only valid when 'season' is also provided."
+            )
+
+        if season is not None:
+            if not isinstance(season, Season):
+                logger.error("View.between failed: season is not a Season enum.")
+                raise ValueError(
+                    f"View.between: season must be a Season enum. "
+                    f"Valid options: {[e.name for e in Season]}."
+                )
+            if season is Season.CURRENT and year is not None:
+                logger.error(
+                    "View.between failed: Cannot combine year with season='current'."
+                )
+                raise ValueError(
+                    "View.between: Cannot combine year with season='current'. "
+                    "The current season is always resolved to the present calendar date."
+                )
+            time_filter: dict[str, Any] = {"season": season.value}
+            if year is not None:
+                time_filter["year"] = year
+        else:
+            if start is None or end is None:
+                logger.error(
+                    "View.between failed: Both 'start' and 'end' must be provided for date range mode."
+                )
+                raise ValueError(
+                    "View.between: Both 'start' and 'end' must be provided for date range mode."
+                )
+            time_filter = {"start": start, "end": end}
+
+        return View(
+            keys=self.keys,
+            entity=self.entity,
+            entity_name=self.entity_name,
+            time_filter=time_filter,
+            join_spec=self.join_spec,
+            season_config=self._season_config,
+        )
+
+    @property
+    def static(self) -> "Result":
+        """Resolve the static GeoParquet file scan and return a :class:`~core_lens.base.result.Result`.
+
+        The result always has ``has_geometry=True`` because the static file is
+        a GeoParquet carrying geometry for every entity instance.
+
+        Returns:
+            Result: A :class:`~core_lens.base.result.Result` with
+            ``resolution="static"`` and ``has_geometry=True``.
+
+        Raises:
+            AttributeError: If the entity has no ``static_path`` (should not
+                happen in practice since ``static_path`` is mandatory).
+
+        """
+        return self._materialise(Resolution.STATIC)
+
+    @property
+    def annual(self) -> "Result":
+        """Resolve the annual Parquet file scan and return a :class:`~core_lens.base.result.Result`.
+
+        Returns:
+            Result: A :class:`~core_lens.base.result.Result` with
+            ``resolution="annual"`` and ``has_geometry=False``.
+
+        Raises:
+            AttributeError: If the entity has no ``annual_path``.
+
+        """
+        return self._materialise(Resolution.ANNUAL)
+
+    @property
+    def sub_annual(self) -> "Result":
+        """Resolve the sub_annual Parquet file scan and return a :class:`~core_lens.base.result.Result`.
+
+        Returns:
+            Result: A :class:`~core_lens.base.result.Result` with
+            ``resolution="sub_annual"`` and ``has_geometry=False``.
+
+        Raises:
+            AttributeError: If the entity has no ``sub_annual_path``.
+
+        """
+        return self._materialise(Resolution.SUB_ANNUAL)
+
+    def _materialise(self, resolution: Resolution) -> "Result":
+        from core_lens.base.result import Result
+
+        profile = self.entity.schema_profile
+
+        logger.info(
+            "Materialising {} resolution for {}", resolution.name, self.entity_name
+        )
+
+        path: str
+        if resolution == Resolution.STATIC:
+            path = self.entity.static_path
+        elif resolution == Resolution.ANNUAL:
+            annual_path = self.entity.annual_path
+            if annual_path is None:
+                logger.error(
+                    "View._materialise failed: Entity '{}' has no annual_path declared.",
+                    self.entity_name,
+                )
+                raise AttributeError(
+                    f"Entity {self.entity_name!r} has no annual_path declared."
+                )
+            path = annual_path
+        else:
+            fn_path = self.entity.sub_annual_path
+            if fn_path is None:
+                logger.error(
+                    "View._materialise failed: Entity '{}' has no sub_annual_path declared.",
+                    self.entity_name,
+                )
+                raise AttributeError(
+                    f"Entity {self.entity_name!r} has no sub_annual_path declared."
+                )
+            path = fn_path
+
+        abs_path = self.entity._resolve(path)
+
+        # Build a time filter expression when a time_filter is present and the
+        # resolution is not static (static files have no time column).
+        time_expr: pl.Expr | None = None
+        if self.time_filter is not None and resolution != Resolution.STATIC:
+            time_col = (
+                profile.annual_time_col
+                if resolution == Resolution.ANNUAL
+                else profile.sub_annual_time_col
+            )
+            if time_col is not None:
+                from core_lens.utils.season import resolve_time_filter
+
+                # Fall back to the default SeasonConfig if none was supplied on this View.
+                from core_lens.aoi import _default_season_config
+
+                season_cfg = self._season_config or _default_season_config()
+
+                # Read is_year_col from the cached schema profile — populated at
+                # detect() time from the Parquet schema, so no extra I/O here.
+                _is_year_col: bool | None = (
+                    profile.annual_is_year_col
+                    if resolution == Resolution.ANNUAL
+                    else profile.sub_annual_is_year_col
+                )
+
+                # Pass as a private hint inside the filter dict (non-mutating copy).
+                _tf = dict(self.time_filter)
+                if "start" in _tf and "end" in _tf:
+                    _tf["_is_year_col"] = _is_year_col
+                logger.debug("Applying time filter expr using {}", _tf)
+                time_expr = resolve_time_filter(_tf, time_col, season_cfg)
+
+        lf = scan_with_key_filter(
+            path=abs_path,
+            key_cols=self.entity.key_cols,
+            key_values=self.keys,
+            time_expr=time_expr,
+            storage_options=self._storage_options or None,
+        )
+        data = lf
+
+        # For sub_annual results, inject temporal grouping columns so that
+        # aggregate(by="year"), aggregate(by="season"), etc. work out of the
+        # box without callers having to derive them manually.
+        if (
+            resolution == Resolution.SUB_ANNUAL
+            and profile.sub_annual_time_col is not None
+        ):
+            from core_lens.utils.season import add_temporal_columns
+            from core_lens.aoi import _default_season_config
+
+            season_cfg = self._season_config or _default_season_config()
+            from typing import cast
+
+            data = cast(
+                pl.LazyFrame,
+                add_temporal_columns(data, profile.sub_annual_time_col, season_cfg),
+            )
+
+        if self.join_spec is not None:
+            other = self.join_spec["other"]
+            agg = self.join_spec["agg"]
+
+            from core_lens.base.entity import _entity_name as _ename
+
+            other_entity_name = _ename(type(other))
+
+            # Ensure geometry is present in data for the join.
+            # For non-static resolutions, load geometry from static file.
+            data_df = collect_lf(data) if isinstance(data, pl.LazyFrame) else data
+            geom_col = profile.geometry_col
+            if geom_col not in data_df.columns:
+                geom_df = self.entity.geometry_lazy.join(
+                    data_df.select(self.entity.key_cols).lazy(),
+                    on=self.entity.key_cols,
+                    how="semi",
+                ).collect()
+                data_df = data_df.join(geom_df, on=self.entity.key_cols, how="left")
+
+            from core_lens.utils.spatial import execute_spatial_join
+
+            logger.debug("Executing spatial join with {}", other_entity_name)
+            data = execute_spatial_join(
+                primary_df=data_df,
+                primary_key_cols=self.entity.key_cols,
+                primary_geom_col=geom_col,
+                primary_geom_type=profile.geometry_type,
+                other_entity=other,
+                agg=agg,
+                other_entity_name=other_entity_name,
+            ).lazy()
+
+        return Result(
+            data=data,
+            resolution=resolution,
+            has_geometry=(resolution == Resolution.STATIC),
+            key_cols=self.entity.key_cols,
+            entity_name=self.entity_name,
+            entity=self.entity,
+        )
